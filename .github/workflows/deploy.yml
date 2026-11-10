@@ -1,12 +1,7 @@
 name: deploy
-run-name: deploy (${{ github.event_name }})
 
-# Two triggers on purpose, to compare both ways of linking a merge to its PR.
 on:
   push:
-    branches: [main]
-  pull_request:
-    types: [closed]
     branches: [main]
 
 permissions:
@@ -15,6 +10,5 @@ permissions:
 
 jobs:
   deploy:
-    if: github.event_name == 'push' || github.event.pull_request.merged
     uses: ./.github/workflows/reusable-deploy.yml
     secrets: inherit
