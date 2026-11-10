@@ -120,6 +120,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_role == 'environments' && github.ref || matrix.target.branches.environments }}
           token: ${{ steps.app-token.outputs.token }}
           path: src/environments
+          fetch-depth: ${{ needs.resolve.outputs.source_role == 'environments' && 2 || 1 }}
 
       - name: Check out poc-modules
         uses: actions/checkout@v5
@@ -128,6 +129,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_role == 'modules' && github.ref || matrix.target.branches.modules }}
           token: ${{ steps.app-token.outputs.token }}
           path: src/modules
+          fetch-depth: ${{ needs.resolve.outputs.source_role == 'modules' && 2 || 1 }}
 
       - name: Check out poc-runner
         uses: actions/checkout@v5
@@ -136,16 +138,18 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_role == 'runner' && github.ref || matrix.target.branches.runner }}
           token: ${{ steps.app-token.outputs.token }}
           path: src/runner
+          fetch-depth: ${{ needs.resolve.outputs.source_role == 'runner' && 2 || 1 }}
 
       - name: Fake plan and plan path
         env:
-          TARGET: ${{ toJSON(matrix.target) }}
+          ROLE: ${{ needs.resolve.outputs.source_role }}
           ENV_NAME: ${{ matrix.target.env }}
           SOURCE_REPO: ${{ needs.resolve.outputs.source_repo }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          result=$(bash tools/scripts/fingerprint.sh "$TARGET" src/environments src/modules src/runner)
+          # The change this PR introduces: PR base (first parent of the merge ref) -> PR merge result.
+          result=$(bash tools/scripts/fingerprint.sh "src/$ROLE" HEAD^1 HEAD "$ROLE" "$ENV_NAME")
           fingerprint=$(tail -n1 <<<"$result" | cut -d= -f2)
           path=$(bash tools/scripts/plan-path.sh "$SOURCE_REPO" "$PR" "$HEAD_SHA" "$ENV_NAME")
 
@@ -159,7 +163,7 @@ jobs:
               "modules \`$(git -C src/modules rev-parse --short HEAD)\`," \
               "runner \`$(git -C src/runner rev-parse --short HEAD)\`"
             echo
-            echo '```'
+            echo '```diff'
             echo "$result"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
