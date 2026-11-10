@@ -36,7 +36,8 @@ change() {
 
 if [[ $role == environments ]]; then
   # An environment's plan depends on the shared code and its own folder, not other envs' folders.
-  shared=$(change . ':(exclude)envs' "${skip[@]}")
+  # The catalogue holds pipeline settings, not infrastructure, so it isn't part of the plan.
+  shared=$(change . ':(exclude)envs' ':(exclude)catalogue' "${skip[@]}")
   own=$(change "envs/$env" "${skip[@]}")
   result=$(printf '%s\n%s' "$shared" "$own" | sed '/^$/d')
 else

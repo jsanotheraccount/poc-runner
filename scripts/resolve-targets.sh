@@ -40,6 +40,12 @@ case $role in
     targets=$(following_base "$role")
     ;;
   environments)
+    # Catalogue changes update pipeline settings only (see catalogue-diff.sh); they need no infrastructure plan.
+    relevant=$(grep -v '^catalogue/' <<<"$relevant" || true)
+    if [[ -z $relevant ]]; then
+      jq -n '{needs_plan: false, reason: "catalogue only: pipeline settings change, no infrastructure plan", targets: []}'
+      exit 0
+    fi
     if grep -qv '^envs/' <<<"$relevant"; then
       reason="shared environments code changed: every environment whose environments branch is $base"
       targets=$(following_base environments)

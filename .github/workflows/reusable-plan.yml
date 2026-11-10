@@ -56,15 +56,32 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           path: tools
 
-      - name: Read the catalogue from poc-environments@main
+      # Other repos' PRs use the catalogue on main. A poc-environments PR uses its own version,
+      # so a PR can add an environment and its catalogue entry together.
+      - name: Read the catalogue
         id: catalogue
         uses: actions/checkout@v5
         with:
           repository: ${{ github.repository_owner }}/poc-environments
-          ref: main
+          ref: ${{ steps.source.outputs.role == 'environments' && github.ref || 'main' }}
           token: ${{ steps.app-token.outputs.token }}
           path: catalogue-repo
-          sparse-checkout: catalogue
+          fetch-depth: ${{ steps.source.outputs.role == 'environments' && 2 || 1 }}
+
+      - name: Catalogue changes (pipeline settings)
+        if: steps.source.outputs.role == 'environments'
+        run: |
+          changes=$(bash tools/scripts/catalogue-diff.sh catalogue-repo HEAD^1 HEAD)
+          jq . <<<"$changes"
+          if [[ $(jq length <<<"$changes") -gt 0 ]]; then
+            {
+              echo "### Pipeline changes (catalogue)"
+              jq -r '.[] | "- **\(.env)** (\(.tier), \(.change)): \(.details | join("; "))"' <<<"$changes"
+              if jq -e 'any(.tier == "production")' <<<"$changes" >/dev/null; then
+                echo; echo "Production catalogue changed: needs a code owner review."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: List the files the PR changes
         env:
@@ -93,7 +110,7 @@ jobs:
           {
             echo "### Targets"
             echo "- Source: \`$GITHUB_REPOSITORY\` PR #$PR into \`$BASE\`"
-            echo "- Catalogue: \`poc-environments@main\` at \`$CATALOGUE_SHA\`"
+            echo "- Catalogue: \`poc-environments\` at \`$CATALOGUE_SHA\`"
             echo "- Needs plan: $(jq -r .needs_plan <<<"$result") ($(jq -r .reason <<<"$result"))"
             echo "- Environments: $(jq -r '[.targets[].env] | if length == 0 then "none" else join(", ") end' <<<"$result")"
             echo "- Plan requested (\`[tf plan all]\` in the head commit): ${{ steps.request.outputs.plan_requested }}"
