@@ -16,6 +16,7 @@ jobs:
       has_targets: ${{ steps.resolve.outputs.has_targets }}
       targets: ${{ steps.resolve.outputs.targets }}
       reason: ${{ steps.resolve.outputs.reason }}
+      plan_requested: ${{ steps.request.outputs.plan_requested }}
     steps:
       - name: Identify the source repo
         id: source
@@ -23,6 +24,19 @@ jobs:
           repo=${GITHUB_REPOSITORY#*/}
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "role=${repo#poc-}" >> "$GITHUB_OUTPUT"
+
+      # Plans run on demand, only when the PR's latest commit message contains [tf plan all].
+      # The pull_request payload has no commit message, so read it from the API.
+      - name: Check for [tf plan all]
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          message=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA" --jq .commit.message)
+          if grep -qF '[tf plan all]' <<<"$message"; then requested=true; else requested=false; fi
+          echo "plan_requested=$requested" >> "$GITHUB_OUTPUT"
+          echo "Head commit ${HEAD_SHA:0:7}: plan requested = $requested"
 
       - name: Get an App token for the POC repos
         id: app-token
@@ -82,12 +96,13 @@ jobs:
             echo "- Catalogue: \`poc-environments@main\` at \`$CATALOGUE_SHA\`"
             echo "- Needs plan: $(jq -r .needs_plan <<<"$result") ($(jq -r .reason <<<"$result"))"
             echo "- Environments: $(jq -r '[.targets[].env] | if length == 0 then "none" else join(", ") end' <<<"$result")"
+            echo "- Plan requested (\`[tf plan all]\` in the head commit): ${{ steps.request.outputs.plan_requested }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   plan:
     name: plan (${{ matrix.target.env }})
     needs: resolve
-    if: needs.resolve.outputs.has_targets == 'true'
+    if: needs.resolve.outputs.has_targets == 'true' && needs.resolve.outputs.plan_requested == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -184,6 +199,7 @@ jobs:
           NEEDS_PLAN: ${{ needs.resolve.outputs.needs_plan }}
           HAS_TARGETS: ${{ needs.resolve.outputs.has_targets }}
           REASON: ${{ needs.resolve.outputs.reason }}
+          PLAN_REQUESTED: ${{ needs.resolve.outputs.plan_requested }}
         run: |
           if [[ $RESOLVE != success ]]; then
             echo "::error::Resolving targets: $RESOLVE"; exit 1
@@ -191,6 +207,10 @@ jobs:
             msg="No plan needed: $REASON"
           elif [[ $HAS_TARGETS != true ]]; then
             msg="No environments follow this branch ($REASON)"
+          elif [[ $PLAN_REQUESTED != true ]]; then
+            # The merge side looks the plan up by the PR head SHA, so the head commit must be the planned one.
+            msg="No plan for this commit. Push a commit with [tf plan all] in its message to plan (an empty commit is fine: git commit --allow-empty -m '[tf plan all]')."
+            echo "::error::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"; exit 1
           elif [[ $PLAN != success ]]; then
             echo "::error::Plan: $PLAN"; exit 1
           else
