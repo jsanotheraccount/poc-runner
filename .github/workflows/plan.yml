@@ -1,0 +1,19 @@
+name: plan
+
+on:
+  pull_request:
+
+# One plan per PR at a time: a new push cancels the plan for the previous commit.
+concurrency:
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Required status check: "plan / plan-gate"
+  plan:
+    uses: ./.github/workflows/reusable-plan.yml
+    secrets: inherit

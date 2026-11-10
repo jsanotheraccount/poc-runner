@@ -1,0 +1,206 @@
+name: reusable-deploy
+
+# Called by the "deploy" workflow in each POC repo after a merge to main, from two triggers:
+#   push to main              -> finds the PR with the commits/{sha}/pulls API
+#   pull_request closed+merged -> reads the PR from the event payload
+# Both rebuild the plan path the PR run printed, and recompute the fingerprint, so the two runs can be compared.
+on:
+  workflow_call:
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    outputs:
+      source_repo: ${{ steps.source.outputs.repo }}
+      source_role: ${{ steps.source.outputs.role }}
+      linked: ${{ steps.link.outputs.linked }}
+      pr: ${{ steps.link.outputs.pr }}
+      head_sha: ${{ steps.link.outputs.head_sha }}
+      merge_sha: ${{ steps.link.outputs.merge_sha }}
+      needs_plan: ${{ steps.resolve.outputs.needs_plan }}
+      has_targets: ${{ steps.resolve.outputs.has_targets }}
+      targets: ${{ steps.resolve.outputs.targets }}
+    steps:
+      - name: Identify the source repo
+        id: source
+        run: |
+          repo=${GITHUB_REPOSITORY#*/}
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "role=${repo#poc-}" >> "$GITHUB_OUTPUT"
+
+      - name: Find the PR behind this merge
+        id: link
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          pr='' head=''
+          if [[ $EVENT == pull_request ]]; then
+            via='pull_request event payload'
+            pr=$EVENT_PR head=$EVENT_HEAD merge=$EVENT_MERGE
+          else
+            via='commits/{sha}/pulls API'
+            merge=$GITHUB_SHA
+            # The commit-to-PR link can lag a little after a merge, so retry.
+            for attempt in 1 2 3 4 5 6; do
+              prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$merge/pulls")
+              echo "Attempt $attempt: $(jq -c '[.[] | {number, merged_at, merge_commit_sha, head: .head.sha}]' <<<"$prs")"
+              match=$(jq -c '[.[] | select(.merged_at != null)] | first // empty' <<<"$prs")
+              if [[ -n $match ]]; then
+                pr=$(jq -r .number <<<"$match") head=$(jq -r .head.sha <<<"$match")
+                break
+              fi
+              sleep 5
+            done
+          fi
+
+          linked=$([[ -n $pr ]] && echo true || echo false)
+          {
+            echo "linked=$linked"
+            echo "pr=$pr"
+            echo "head_sha=$head"
+            echo "merge_sha=$merge"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Link ($EVENT)"
+            echo "- Merge commit: \`$merge\`"
+            if [[ $linked == true ]]; then
+              echo "- PR: #$pr, head \`$head\` (found via $via)"
+            else
+              echo "- No merged PR found for this commit (direct push?). Nothing to compare."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Get an App token for the POC repos
+        if: steps.link.outputs.linked == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.POC_APP_ID }}
+          private-key: ${{ secrets.POC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: poc-environments,poc-modules,poc-runner
+
+      - name: Check out the runner scripts
+        if: steps.link.outputs.linked == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: tools
+
+      - name: Read the catalogue from poc-environments@main
+        if: steps.link.outputs.linked == 'true'
+        id: catalogue
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-environments
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: catalogue-repo
+          sparse-checkout: catalogue
+
+      - name: Resolve target environments
+        if: steps.link.outputs.linked == 'true'
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLE: ${{ steps.source.outputs.role }}
+          PR: ${{ steps.link.outputs.pr }}
+          CATALOGUE_SHA: ${{ steps.catalogue.outputs.commit }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' > changed-files.txt
+          result=$(bash tools/scripts/resolve-targets.sh "$ROLE" main changed-files.txt catalogue-repo/catalogue)
+          jq . <<<"$result"
+          {
+            echo "needs_plan=$(jq -r .needs_plan <<<"$result")"
+            echo "has_targets=$(jq -r '.targets | length > 0' <<<"$result")"
+            echo "targets=$(jq -c .targets <<<"$result")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Targets"
+            echo "- Catalogue: \`poc-environments@main\` at \`$CATALOGUE_SHA\`"
+            echo "- Needs plan: $(jq -r .needs_plan <<<"$result") ($(jq -r .reason <<<"$result"))"
+            echo "- Environments: $(jq -r '[.targets[].env] | if length == 0 then "none" else join(", ") end' <<<"$result")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  compare:
+    name: compare (${{ matrix.target.env }})
+    needs: link
+    if: needs.link.outputs.linked == 'true' && needs.link.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.link.outputs.targets) }}
+    steps:
+      - name: Get an App token for the POC repos
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.POC_APP_ID }}
+          private-key: ${{ secrets.POC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: poc-environments,poc-modules,poc-runner
+
+      - name: Check out the runner scripts
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: tools
+
+      # The repo with the change is checked out at the merge commit;
+      # the other two at the branch this environment follows in the catalogue now.
+      - name: Check out poc-environments
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-environments
+          ref: ${{ needs.link.outputs.source_role == 'environments' && needs.link.outputs.merge_sha || matrix.target.branches.environments }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/environments
+
+      - name: Check out poc-modules
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-modules
+          ref: ${{ needs.link.outputs.source_role == 'modules' && needs.link.outputs.merge_sha || matrix.target.branches.modules }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/modules
+
+      - name: Check out poc-runner
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: ${{ needs.link.outputs.source_role == 'runner' && needs.link.outputs.merge_sha || matrix.target.branches.runner }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/runner
+
+      - name: Rebuild plan path and fingerprint
+        env:
+          TARGET: ${{ toJSON(matrix.target) }}
+          ENV_NAME: ${{ matrix.target.env }}
+          SOURCE_REPO: ${{ needs.link.outputs.source_repo }}
+          PR: ${{ needs.link.outputs.pr }}
+          HEAD_SHA: ${{ needs.link.outputs.head_sha }}
+        run: |
+          result=$(bash tools/scripts/fingerprint.sh "$TARGET" src/environments src/modules src/runner)
+          fingerprint=$(tail -n1 <<<"$result" | cut -d= -f2)
+          path=$(bash tools/scripts/plan-path.sh "$SOURCE_REPO" "$PR" "$HEAD_SHA" "$ENV_NAME")
+
+          echo "PLAN_PATH=$path FINGERPRINT=$fingerprint"
+          echo "$result"
+          {
+            echo "### $ENV_NAME"
+            echo "- Plan path: \`$path\`"
+            echo "- Fingerprint now: \`$fingerprint\` (compare with the PR run's plan for the same path)"
+            echo
+            echo '```'
+            echo "$result"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

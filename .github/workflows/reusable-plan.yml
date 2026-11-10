@@ -1,0 +1,195 @@
+name: reusable-plan
+
+# Called by the "plan" workflow in each POC repo on pull_request.
+# In a reusable workflow, the github context (repo, event, PR) is the caller's.
+# Secrets come from the caller through `secrets: inherit`.
+on:
+  workflow_call:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      source_repo: ${{ steps.source.outputs.repo }}
+      source_role: ${{ steps.source.outputs.role }}
+      needs_plan: ${{ steps.resolve.outputs.needs_plan }}
+      has_targets: ${{ steps.resolve.outputs.has_targets }}
+      targets: ${{ steps.resolve.outputs.targets }}
+      reason: ${{ steps.resolve.outputs.reason }}
+    steps:
+      - name: Identify the source repo
+        id: source
+        run: |
+          repo=${GITHUB_REPOSITORY#*/}
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "role=${repo#poc-}" >> "$GITHUB_OUTPUT"
+
+      - name: Get an App token for the POC repos
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.POC_APP_ID }}
+          private-key: ${{ secrets.POC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: poc-environments,poc-modules,poc-runner
+
+      - name: Check out the runner scripts
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          # A runner PR tests its own scripts; every other repo uses runner main.
+          ref: ${{ steps.source.outputs.role == 'runner' && github.ref || 'main' }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: tools
+
+      - name: Read the catalogue from poc-environments@main
+        id: catalogue
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-environments
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: catalogue-repo
+          sparse-checkout: catalogue
+
+      - name: List the files the PR changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' > changed-files.txt
+          cat changed-files.txt
+
+      - name: Resolve target environments
+        id: resolve
+        env:
+          ROLE: ${{ steps.source.outputs.role }}
+          BASE: ${{ github.base_ref }}
+          PR: ${{ github.event.pull_request.number }}
+          CATALOGUE_SHA: ${{ steps.catalogue.outputs.commit }}
+        run: |
+          result=$(bash tools/scripts/resolve-targets.sh "$ROLE" "$BASE" changed-files.txt catalogue-repo/catalogue)
+          jq . <<<"$result"
+          {
+            echo "needs_plan=$(jq -r .needs_plan <<<"$result")"
+            echo "has_targets=$(jq -r '.targets | length > 0' <<<"$result")"
+            echo "targets=$(jq -c .targets <<<"$result")"
+            echo "reason=$(jq -r .reason <<<"$result")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Targets"
+            echo "- Source: \`$GITHUB_REPOSITORY\` PR #$PR into \`$BASE\`"
+            echo "- Catalogue: \`poc-environments@main\` at \`$CATALOGUE_SHA\`"
+            echo "- Needs plan: $(jq -r .needs_plan <<<"$result") ($(jq -r .reason <<<"$result"))"
+            echo "- Environments: $(jq -r '[.targets[].env] | if length == 0 then "none" else join(", ") end' <<<"$result")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  plan:
+    name: plan (${{ matrix.target.env }})
+    needs: resolve
+    if: needs.resolve.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    steps:
+      - name: Get an App token for the POC repos
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.POC_APP_ID }}
+          private-key: ${{ secrets.POC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: poc-environments,poc-modules,poc-runner
+
+      - name: Check out the runner scripts
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: ${{ needs.resolve.outputs.source_role == 'runner' && github.ref || 'main' }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: tools
+
+      # The repo with the change is checked out at the PR merge ref;
+      # the other two at the branch this environment follows in the catalogue.
+      - name: Check out poc-environments
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-environments
+          ref: ${{ needs.resolve.outputs.source_role == 'environments' && github.ref || matrix.target.branches.environments }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/environments
+
+      - name: Check out poc-modules
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-modules
+          ref: ${{ needs.resolve.outputs.source_role == 'modules' && github.ref || matrix.target.branches.modules }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/modules
+
+      - name: Check out poc-runner
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: ${{ needs.resolve.outputs.source_role == 'runner' && github.ref || matrix.target.branches.runner }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: src/runner
+
+      - name: Fake plan and plan path
+        env:
+          TARGET: ${{ toJSON(matrix.target) }}
+          ENV_NAME: ${{ matrix.target.env }}
+          SOURCE_REPO: ${{ needs.resolve.outputs.source_repo }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          result=$(bash tools/scripts/fingerprint.sh "$TARGET" src/environments src/modules src/runner)
+          fingerprint=$(tail -n1 <<<"$result" | cut -d= -f2)
+          path=$(bash tools/scripts/plan-path.sh "$SOURCE_REPO" "$PR" "$HEAD_SHA" "$ENV_NAME")
+
+          echo "PLAN_PATH=$path FINGERPRINT=$fingerprint"
+          echo "$result"
+          {
+            echo "### $ENV_NAME"
+            echo "- Plan path: \`$path\`"
+            echo "- Fingerprint: \`$fingerprint\`"
+            echo "- Commits: environments \`$(git -C src/environments rev-parse --short HEAD)\`," \
+              "modules \`$(git -C src/modules rev-parse --short HEAD)\`," \
+              "runner \`$(git -C src/runner rev-parse --short HEAD)\`"
+            echo
+            echo '```'
+            echo "$result"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The single required status check. It always runs, so it never sits at "Expected — waiting".
+  # always() rather than !cancelled(): a cancelled run must fail the gate, not skip it,
+  # because a skipped required check counts as passing.
+  gate:
+    name: plan-gate
+    needs: [resolve, plan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide
+        env:
+          RESOLVE: ${{ needs.resolve.result }}
+          PLAN: ${{ needs.plan.result }}
+          NEEDS_PLAN: ${{ needs.resolve.outputs.needs_plan }}
+          HAS_TARGETS: ${{ needs.resolve.outputs.has_targets }}
+          REASON: ${{ needs.resolve.outputs.reason }}
+        run: |
+          if [[ $RESOLVE != success ]]; then
+            echo "::error::Resolving targets: $RESOLVE"; exit 1
+          elif [[ $NEEDS_PLAN != true ]]; then
+            msg="No plan needed: $REASON"
+          elif [[ $HAS_TARGETS != true ]]; then
+            msg="No environments follow this branch ($REASON)"
+          elif [[ $PLAN != success ]]; then
+            echo "::error::Plan: $PLAN"; exit 1
+          else
+            msg="Plans complete"
+          fi
+          echo "$msg" | tee -a "$GITHUB_STEP_SUMMARY"
