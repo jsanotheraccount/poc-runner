@@ -25,7 +25,7 @@ jobs:
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "role=${repo#poc-}" >> "$GITHUB_OUTPUT"
 
-      # Plans run on demand: only when the PR's latest commit message contains [tf plan all].
+      # Plans run on demand, only when the PR's latest commit message contains [tf plan all].
       # The pull_request payload has no commit message, so read it from the API.
       - name: Check for [tf plan all]
         id: request
