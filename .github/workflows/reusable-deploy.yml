@@ -117,6 +117,40 @@ jobs:
             echo "- Environments: $(jq -r '[.targets[].env] | if length == 0 then "none" else join(", ") end' <<<"$result")"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Catalogue changes update the affected environments' pipeline settings only, never infrastructure.
+  # Runs on every push to poc-environments main, PR or not: the catalogue on main is the source of truth.
+  pipelines:
+    if: github.event_name == 'push' && github.event.repository.name == 'poc-environments'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the runner scripts
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/poc-runner
+          ref: main
+          path: tools
+
+      - name: Check out poc-environments
+        uses: actions/checkout@v5
+        with:
+          path: src/environments
+          fetch-depth: 0
+
+      - name: Update pipelines for changed catalogue entries
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          changes=$(bash tools/scripts/catalogue-diff.sh src/environments "$BEFORE" "$GITHUB_SHA")
+          jq . <<<"$changes"
+          {
+            echo "### Pipeline updates"
+            if [[ $(jq length <<<"$changes") -eq 0 ]]; then
+              echo "No catalogue changes."
+            else
+              jq -r '.[] | "- Would update `\(.env)-terraform-deploy` (\(.tier), \(.change)): \(.details | join("; "))"' <<<"$changes"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   compare:
     name: compare (${{ matrix.target.env }})
     needs: link
