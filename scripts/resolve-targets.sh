@@ -51,6 +51,13 @@ case $role in
       targets=$(following_base environments)
     else
       changed_envs=$(sed -n 's#^envs/\([^/]*\)/.*#\1#p' <<<"$relevant" | sort -u | jq -R . | jq -s .)
+      # An env folder without a catalogue entry on main can't be planned. Fail rather than pass with no plan:
+      # the catalogue entry has to be merged first, in its own PR.
+      missing=$(jq -r --argjson envs "$changed_envs" '[.[].env] as $known | $envs - $known | join(", ")' <<<"$catalogue")
+      if [[ -n $missing ]]; then
+        echo "No catalogue entry on main for: $missing. Merge the catalogue entry in a separate PR first." >&2
+        exit 1
+      fi
       reason="changed env folders whose environments branch is $base"
       targets=$(following_base environments |
         jq --argjson envs "$changed_envs" 'map(select(.env as $e | $envs | index($e)))')

@@ -58,20 +58,30 @@ jobs:
 
       # Other repos' PRs use the catalogue on main. A poc-environments PR uses its own version,
       # so a PR can add an environment and its catalogue entry together.
-      - name: Read the catalogue
+      # Targeting always uses the catalogue on main, never a PR's version: otherwise a PR could
+      # point a production environment at another branch before that change is approved and merged.
+      - name: Read the catalogue from poc-environments@main
         id: catalogue
         uses: actions/checkout@v5
         with:
           repository: ${{ github.repository_owner }}/poc-environments
-          ref: ${{ steps.source.outputs.role == 'environments' && github.ref || 'main' }}
+          ref: main
           token: ${{ steps.app-token.outputs.token }}
           path: catalogue-repo
-          fetch-depth: ${{ steps.source.outputs.role == 'environments' && 2 || 1 }}
+          sparse-checkout: catalogue
+
+      # Display only: what this PR changes in the catalogue. Never used for targeting.
+      - name: Check out the PR to show its catalogue changes
+        if: steps.source.outputs.role == 'environments'
+        uses: actions/checkout@v5
+        with:
+          path: pr-repo
+          fetch-depth: 2
 
       - name: Catalogue changes (pipeline settings)
         if: steps.source.outputs.role == 'environments'
         run: |
-          changes=$(bash tools/scripts/catalogue-diff.sh catalogue-repo HEAD^1 HEAD)
+          changes=$(bash tools/scripts/catalogue-diff.sh pr-repo HEAD^1 HEAD)
           jq . <<<"$changes"
           if [[ $(jq length <<<"$changes") -gt 0 ]]; then
             {
@@ -99,7 +109,9 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           CATALOGUE_SHA: ${{ steps.catalogue.outputs.commit }}
         run: |
-          result=$(bash tools/scripts/resolve-targets.sh "$ROLE" "$BASE" changed-files.txt catalogue-repo/catalogue)
+          if ! result=$(bash tools/scripts/resolve-targets.sh "$ROLE" "$BASE" changed-files.txt catalogue-repo/catalogue 2>resolve-error.txt); then
+            echo "::error::$(cat resolve-error.txt)"; cat resolve-error.txt >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
           jq . <<<"$result"
           {
             echo "needs_plan=$(jq -r .needs_plan <<<"$result")"
