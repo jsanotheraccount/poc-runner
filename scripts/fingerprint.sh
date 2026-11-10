@@ -21,15 +21,24 @@ repo_dir=$1 from=$2 to=$3 role=$4 env=$5
 # Paths that never affect a plan.
 skip=(':(exclude,glob)**/*.md' ':(exclude)docs')
 
+# Fail loudly if either commit is missing (for example, a shallow checkout), instead of an empty change.
+for commit in "$from" "$to"; do
+  git -C "$repo_dir" rev-parse --verify --quiet "$commit^{commit}" >/dev/null ||
+    { echo "fingerprint.sh: $commit is not available in $repo_dir" >&2; exit 1; }
+done
+
 # Normalised diff: drop "diff --git" and "index <sha>" lines and "@@ -1 +1 @@" position headers.
 change() {
-  git -C "$repo_dir" diff -U0 --no-color --no-ext-diff --no-renames "$from" "$to" -- "$@" |
-    grep -vE '^(diff --git |index |@@ )' || true
+  local diff
+  diff=$(git -C "$repo_dir" diff -U0 --no-color --no-ext-diff --no-renames "$from" "$to" -- "$@")
+  grep -vE '^(diff --git |index |@@ )' <<<"$diff" || true # grep exits 1 when nothing is left
 }
 
 if [[ $role == environments ]]; then
   # An environment's plan depends on the shared code and its own folder, not other envs' folders.
-  result=$(change . ':(exclude)envs' "${skip[@]}"; change "envs/$env" "${skip[@]}")
+  shared=$(change . ':(exclude)envs' "${skip[@]}")
+  own=$(change "envs/$env" "${skip[@]}")
+  result=$(printf '%s\n%s' "$shared" "$own" | sed '/^$/d')
 else
   result=$(change . "${skip[@]}")
 fi
